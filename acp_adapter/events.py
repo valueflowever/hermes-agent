@@ -8,6 +8,7 @@ thread while the event loop lives on the main thread).
 """
 
 import asyncio
+import inspect
 import json
 import logging
 from collections import deque
@@ -31,13 +32,27 @@ def _send_update(
     update: Any,
 ) -> None:
     """Fire-and-forget an ACP session update from a worker thread."""
+    coro = None
     try:
-        future = asyncio.run_coroutine_threadsafe(
-            conn.session_update(session_id, update), loop
-        )
+        coro = conn.session_update(session_id, update)
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
         future.result(timeout=5)
     except Exception:
         logger.debug("Failed to send ACP update", exc_info=True)
+    finally:
+        # Unit tests often monkeypatch run_coroutine_threadsafe with a plain
+        # Mock. In that case the coroutine is never actually scheduled, which
+        # would trigger "coroutine was never awaited" warnings at GC time.
+        # Close only when the coroutine clearly wasn't handed to the real
+        # asyncio scheduler.
+        if coro is not None and inspect.iscoroutine(coro):
+            try:
+                from unittest.mock import Mock
+
+                if isinstance(asyncio.run_coroutine_threadsafe, Mock):
+                    coro.close()
+            except Exception:
+                pass
 
 
 # ------------------------------------------------------------------
