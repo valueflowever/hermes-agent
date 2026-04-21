@@ -8,6 +8,9 @@ from tools.session_search_tool import (
     _format_timestamp,
     _format_conversation,
     _truncate_around_matches,
+    _metadata_query_terms,
+    _score_metadata_text,
+    _metadata_session_candidates,
     _HIDDEN_SESSION_SOURCES,
     MAX_SESSION_CHARS,
     SESSION_SEARCH_SCHEMA,
@@ -182,6 +185,94 @@ class TestTruncateAroundMatches:
 
 
 # =========================================================================
+# metadata fallback helpers
+# =========================================================================
+
+
+class TestSessionMetadataFallback:
+    def test_metadata_query_terms_filters_noise(self):
+        terms = _metadata_query_terms("What did we do about Docker deploy today?")
+        assert "docker" in terms
+        assert "deploy" in terms
+        assert "what" not in terms
+        assert "did" not in terms
+
+    def test_score_metadata_text_prefers_exact_phrase(self):
+        score, exact = _score_metadata_text(
+            "docker networking",
+            "We debugged docker networking in the gateway session",
+        )
+        assert score > 0
+        assert exact > 0
+
+    def test_metadata_candidates_match_title_or_preview(self):
+        from unittest.mock import MagicMock
+
+        mock_db = MagicMock()
+        mock_db.list_sessions_rich.return_value = [
+            {
+                "id": "sess-1",
+                "title": "Docker networking fix",
+                "preview": "Investigated bridge mode issues",
+                "source": "cli",
+                "model": "test",
+                "started_at": 1700000000,
+            },
+            {
+                "id": "sess-2",
+                "title": "Unrelated topic",
+                "preview": "Something else entirely",
+                "source": "cli",
+                "model": "test",
+                "started_at": 1700000001,
+            },
+        ]
+
+        candidates = _metadata_session_candidates(
+            mock_db,
+            "docker networking",
+            limit=3,
+            excluded_session_ids=set(),
+        )
+
+        assert [c["session_id"] for c in candidates] == ["sess-1"]
+
+    def test_metadata_candidates_skip_child_sessions(self):
+        from unittest.mock import MagicMock
+
+        mock_db = MagicMock()
+        mock_db.list_sessions_rich.return_value = [
+            {
+                "id": "child-sess",
+                "title": "Docker networking fix",
+                "preview": "Delegated child session",
+                "source": "cli",
+                "model": "test",
+                "started_at": 1700000000,
+                "parent_session_id": "root-sess",
+            },
+            {
+                "id": "root-sess",
+                "title": "Main docker session",
+                "preview": "Parent session preview",
+                "source": "cli",
+                "model": "test",
+                "started_at": 1700000001,
+                "parent_session_id": None,
+            },
+        ]
+
+        candidates = _metadata_session_candidates(
+            mock_db,
+            "docker networking",
+            limit=3,
+            excluded_session_ids=set(),
+        )
+
+        assert [c["session_id"] for c in candidates] == ["root-sess"]
+
+
+# =========================================================================
 # session_search (dispatcher)
 # =========================================================================
 
@@ -290,6 +381,41 @@ class TestSessionSearch:
         assert result["results"] == []
         assert result["sessions_searched"] == 0
 
+    def test_metadata_fallback_uses_title_match_when_fts_is_empty(self):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = []
+        mock_db.list_sessions_rich.return_value = [
+            {
+                "id": "sess-title",
+                "title": "Docker networking fix",
+                "preview": "Investigated gateway bridge issues",
+                "source": "cli",
+                "model": "test-model",
+                "started_at": 1700000000,
+                "parent_session_id": None,
+            }
+        ]
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "Can you help with docker networking?"},
+            {"role": "assistant", "content": "We fixed the bridge settings."},
+        ]
+        mock_db.get_session.return_value = {
+            "started_at": 1700000000,
+            "source": "cli",
+            "title": "Docker networking fix",
+            "parent_session_id": None,
+        }
+
+        result = json.loads(session_search(query="docker networking", db=mock_db))
+
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert result["sessions_searched"] == 1
+        assert result["results"][0]["session_id"] == "sess-title"
+
     def test_current_root_session_excludes_child_lineage(self):
         """Delegation child hits should be excluded when they resolve to the current root session."""
         from unittest.mock import MagicMock
@@ -318,3 +444,63 @@ class TestSessionSearch:
         assert result["count"] == 0
         assert result["results"] == []
         assert result["sessions_searched"] == 0
+
+    def test_recent_sessions_excludes_actual_parent_not_longest_id(self):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import _list_recent_sessions
+
+        mock_db = MagicMock()
+        mock_db.list_sessions_rich.return_value = [
+            {
+                "id": "root",
+                "title": "Parent session",
+                "source": "cli",
+                "started_at": 1700000000,
+                "last_active": 1700000001,
+                "message_count": 2,
+                "preview": "parent preview",
+                "parent_session_id": None,
+            },
+            {
+                "id": "child-with-a-very-long-id",
+                "title": "Active child session",
+                "source": "cli",
+                "started_at": 1700000002,
+                "last_active": 1700000003,
+                "message_count": 2,
+                "preview": "child preview",
+                "parent_session_id": "root",
+            },
+            {
+                "id": "other",
+                "title": "Other session",
+                "source": "cli",
+                "started_at": 1700000004,
+                "last_active": 1700000005,
+                "message_count": 2,
+                "preview": "other preview",
+                "parent_session_id": None,
+            },
+        ]
+
+        def _get_session(session_id):
+            if session_id == "child-with-a-very-long-id":
+                return {"parent_session_id": "root"}
+            if session_id == "root":
+                return {"parent_session_id": None}
+            return None
+
+        mock_db.get_session.side_effect = _get_session
+
+        result = json.loads(
+            _list_recent_sessions(
+                mock_db,
+                limit=5,
+                current_session_id="child-with-a-very-long-id",
+            )
+        )
+
+        session_ids = [entry["session_id"] for entry in result["results"]]
+        assert "root" not in session_ids
+        assert "child-with-a-very-long-id" not in session_ids
+        assert "other" in session_ids

@@ -13,7 +13,7 @@ import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -21,6 +21,7 @@ import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from tools.memory_tool import MemoryStore
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +237,257 @@ def _mock_response(
     else:
         resp.usage = None
     return resp
+
+
+class TestOutputReviewGate:
+    def test_review_gate_preflight_disables_gate_when_no_aux_client(self, agent):
+        agent._output_review_enabled = True
+
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(None, None),
+        ):
+            agent._prepare_output_review_for_turn()
+
+        assert agent._output_review_enabled_for_turn is False
+        assert agent._output_review_status.startswith("bypassed:")
+        assert agent._suppress_assistant_text_output is False
+
+    def test_review_candidate_response_marks_gate_unavailable_on_non_json(self, agent):
+        agent._output_review_enabled = True
+        agent._output_review_enabled_for_turn = True
+
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            return_value=SimpleNamespace(),
+        ), patch(
+            "agent.auxiliary_client.extract_content_or_reasoning",
+            return_value="not-json",
+        ):
+            result = agent._review_candidate_response(
+                user_message="Please answer carefully.",
+                candidate_response="Draft answer.",
+                messages=[],
+            )
+
+        assert result["approved"] is True
+        assert agent._output_review_enabled_for_turn is False
+        assert agent._output_review_status.startswith("bypassed:")
+
+    def test_rejected_draft_is_reworked_and_failure_memory_saved(
+        self, agent, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("tools.memory_tool.MEMORY_DIR", tmp_path)
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+
+        store = MemoryStore(memory_char_limit=500, user_char_limit=300, failure_char_limit=800)
+        store.load_from_disk()
+
+        agent._memory_store = store
+        agent._failure_memory_enabled = True
+        agent._output_review_enabled = True
+        agent._output_review_max_retries = 2
+        agent._output_review_notify_on_retry = False
+
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response("Too vague."),
+            _mock_response("Concrete final answer."),
+        ]
+
+        with patch.object(
+            agent,
+            "_review_candidate_response",
+            side_effect=[
+                {
+                    "approved": False,
+                    "feedback": "Add concrete details and avoid vague summaries.",
+                    "failure_memory": "Avoid vague drafts that skip the requested concrete outcome.",
+                    "route_name": "vague-drafts-concrete-outcome",
+                },
+                {"approved": True, "feedback": "", "failure_memory": "", "route_name": ""},
+            ],
+        ):
+            result = agent.run_conversation("Please answer concretely.")
+
+        assert result["final_response"] == "Concrete final answer."
+        assert all(not msg.get("_internal_review") for msg in result["messages"])
+        assert any("Avoid vague drafts" in entry for entry in store.failure_entries)
+
+    def test_failure_memory_is_injected_into_turn_context(
+        self, agent, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("tools.memory_tool.MEMORY_DIR", tmp_path)
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+
+        store = MemoryStore(memory_char_limit=500, user_char_limit=300, failure_char_limit=800)
+        store.load_from_disk()
+        store.add(
+            "failure",
+            "Task hint: add output review gate\nAvoid next time: do not leak an unreviewed draft to the user.",
+            route_name="output-review-unreviewed-draft",
+        )
+
+        agent._memory_store = store
+        agent._failure_memory_enabled = True
+        agent._failure_recall_max_entries = 3
+        agent._failure_recall_max_chars = 1400
+        agent._output_review_enabled = False
+
+        captured = {}
+
+        def _capture_create(**kwargs):
+            captured["messages"] = kwargs["messages"]
+            return _mock_response("Looks good.")
+
+        agent.client.chat.completions.create.side_effect = _capture_create
+
+        result = agent.run_conversation("Please add an output review gate.")
+
+        assert result["final_response"] == "Looks good."
+        user_messages = [m for m in captured["messages"] if m.get("role") == "user"]
+        assert user_messages
+        assert "FAILURE ROUTES" in user_messages[-1]["content"]
+        assert "output-review-unreviewed-draft.md" in user_messages[-1]["content"]
+        assert "unreviewed draft" in user_messages[-1]["content"]
+
+    def test_stream_output_is_suppressed_while_review_gate_is_active(self, agent):
+        deltas = []
+        agent.stream_delta_callback = lambda text: deltas.append(text)
+        agent._output_review_enabled = True
+        agent._output_review_enabled_for_turn = True
+        agent._suppress_assistant_text_output = True
+
+        agent._fire_stream_delta("hidden draft")
+        agent._emit_interim_assistant_message({"role": "assistant", "content": "hidden"})
+
+        assert deltas == []
+
+    def test_progress_and_debug_output_do_not_leak_hidden_draft(self, agent):
+        agent._output_review_enabled = True
+        agent._output_review_max_retries = 0
+        agent._output_review_notify_on_retry = False
+        agent.tool_progress_callback = MagicMock()
+
+        debug_lines = []
+        agent._vprint = MagicMock(side_effect=lambda *args, **kwargs: debug_lines.append(args[0]))
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response("Hidden draft that should not leak."),
+        ]
+
+        with patch.object(
+            agent,
+            "_prepare_output_review_for_turn",
+            side_effect=lambda: (
+                setattr(agent, "_output_review_enabled_for_turn", True),
+                setattr(agent, "_output_review_status", "enabled"),
+            ),
+        ), patch.object(
+            agent,
+            "_review_candidate_response",
+            return_value={
+                "approved": False,
+                "feedback": "Reject the hidden draft.",
+                "failure_memory": "",
+                "route_name": "",
+            },
+        ):
+            result = agent.run_conversation("Please answer carefully.")
+
+        assert result["final_response"].startswith("I couldn't produce an answer")
+        assert all("Hidden draft that should not leak." not in line for line in debug_lines)
+        agent.tool_progress_callback.assert_not_called()
+
+    def test_run_conversation_reports_bypassed_output_review_status(self, agent):
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(None, None),
+        ):
+            agent.client.chat.completions.create.side_effect = [
+                _mock_response("Concrete final answer."),
+            ]
+            result = agent.run_conversation("Please answer concretely.")
+
+        assert result["final_response"] == "Concrete final answer."
+        assert result["output_review_status"].startswith("bypassed:")
+
+    def test_postcheck_review_replaces_hidden_summary_draft(self, agent):
+        agent._output_review_enabled = True
+        agent.max_iterations = 0
+
+        def _fake_prepare():
+            agent._output_review_enabled_for_turn = True
+            agent._output_review_status = "enabled"
+
+        def _fake_handle_max_iterations(messages, _api_call_count):
+            messages.append({"role": "assistant", "content": "Hidden summary draft."})
+            return "Hidden summary draft."
+
+        with patch.object(agent, "_prepare_output_review_for_turn", side_effect=_fake_prepare), patch.object(
+            agent,
+            "_handle_max_iterations",
+            side_effect=_fake_handle_max_iterations,
+        ), patch.object(
+            agent,
+            "_review_candidate_response",
+            return_value={
+                "approved": False,
+                "feedback": "Do not surface this summary.",
+                "failure_memory": "Do not keep unreviewed summaries in visible history.",
+                "route_name": "output-review-summary-draft",
+            },
+        ):
+            result = agent.run_conversation("Summarize the work.")
+
+        assert result["final_response"].startswith("I couldn't produce an answer")
+        visible_contents = [msg.get("content", "") for msg in result["messages"]]
+        assert "Hidden summary draft." not in visible_contents
+
+    def test_session_db_flush_skips_hidden_messages(self, agent):
+        agent._session_db = MagicMock()
+        agent.session_id = "sess-hidden"
+        agent._last_flushed_db_idx = 0
+
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "prefill", "_thinking_prefill": True},
+            {"role": "assistant", "content": "internal", "_internal_review": True},
+            {"role": "assistant", "content": "visible reply"},
+        ]
+
+        agent._flush_messages_to_session_db(messages, conversation_history=None)
+
+        persisted_contents = [
+            call.kwargs["content"]
+            for call in agent._session_db.append_message.call_args_list
+        ]
+        assert persisted_contents == ["hello", "visible reply"]
+
+    def test_session_db_flush_cursor_stays_aligned_after_hidden_messages(self, agent):
+        agent._session_db = MagicMock()
+        agent.session_id = "sess-hidden"
+        agent._last_flushed_db_idx = 0
+
+        first_turn = [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "prefill", "_thinking_prefill": True},
+            {"role": "assistant", "content": "a1"},
+        ]
+        agent._flush_messages_to_session_db(first_turn, conversation_history=None)
+        agent._session_db.append_message.reset_mock()
+
+        second_turn = [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+        ]
+        agent._flush_messages_to_session_db(second_turn, conversation_history=second_turn[:2])
+
+        persisted_contents = [
+            call.kwargs["content"]
+            for call in agent._session_db.append_message.call_args_list
+        ]
+        assert persisted_contents == ["u2", "a2"]
 
 
 # ===================================================================
@@ -1221,7 +1473,7 @@ class TestConcurrentToolExecution:
         with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
             with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
                 agent._execute_tool_calls(mock_msg, messages, "task-1")
-                mock_seq.assert_called_once()
+                assert mock_seq.call_count == 2
                 mock_con.assert_not_called()
 
     def test_multiple_tools_uses_concurrent_path(self, agent):
@@ -1245,7 +1497,7 @@ class TestConcurrentToolExecution:
         with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
             with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
                 agent._execute_tool_calls(mock_msg, messages, "task-1")
-                mock_seq.assert_called_once()
+                assert mock_seq.call_count == 2
                 mock_con.assert_not_called()
 
     def test_write_batch_forces_sequential(self, agent):
@@ -1257,7 +1509,7 @@ class TestConcurrentToolExecution:
         with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
             with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
                 agent._execute_tool_calls(mock_msg, messages, "task-1")
-                mock_seq.assert_called_once()
+                assert mock_seq.call_count == 2
                 mock_con.assert_not_called()
 
     def test_disjoint_write_batch_uses_concurrent_path(self, agent):
@@ -1309,7 +1561,7 @@ class TestConcurrentToolExecution:
         with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
             with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
                 agent._execute_tool_calls(mock_msg, messages, "task-1")
-                mock_seq.assert_called_once()
+                assert mock_seq.call_count == 2
                 mock_con.assert_not_called()
 
     def test_non_dict_args_forces_sequential(self, agent):
@@ -1321,8 +1573,27 @@ class TestConcurrentToolExecution:
         with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
             with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
                 agent._execute_tool_calls(mock_msg, messages, "task-1")
-                mock_seq.assert_called_once()
+                assert mock_seq.call_count == 2
                 mock_con.assert_not_called()
+
+    def test_mixed_batches_partition_into_concurrent_and_serial_groups(self, agent):
+        """Consecutive safe tools should still run concurrently around serial tools."""
+        tc1 = _mock_tool_call(name="web_search", arguments='{"q":"alpha"}', call_id="c1")
+        tc2 = _mock_tool_call(name="read_file", arguments='{"path":"a.py"}', call_id="c2")
+        tc3 = _mock_tool_call(name="terminal", arguments='{"command":"pwd"}', call_id="c3")
+        tc4 = _mock_tool_call(name="web_search", arguments='{"q":"beta"}', call_id="c4")
+        tc5 = _mock_tool_call(name="read_file", arguments='{"path":"b.py"}', call_id="c5")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2, tc3, tc4, tc5])
+        messages = []
+
+        with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
+            with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
+                agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        assert mock_con.call_count == 2
+        assert mock_seq.call_count == 1
+        assert [len(call.args[0].tool_calls) for call in mock_con.call_args_list] == [2, 2]
+        assert [len(call.args[0].tool_calls) for call in mock_seq.call_args_list] == [1]
 
     def test_concurrent_executes_all_tools(self, agent):
         """Concurrent path should execute all tools and append results in order."""
@@ -1487,6 +1758,62 @@ class TestConcurrentToolExecution:
             result = agent._invoke_tool("todo", {"todos": []}, "task-1")
             mock_todo.assert_called_once()
         assert "ok" in result
+
+    def test_invoke_tool_memory_calls_hooks_and_mirrors_provider_write(self, agent):
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.has_tool.return_value = False
+
+        with (
+            patch("tools.memory_tool.memory_tool", return_value='{"success": true}'),
+            patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
+        ):
+            result = agent._invoke_tool(
+                "memory",
+                {
+                    "action": "add",
+                    "target": "memory",
+                    "content": "remember this",
+                    "route_name": "draft-route",
+                },
+                "task-1",
+                tool_call_id="call-1",
+            )
+
+        assert result == '{"success": true}'
+        agent._memory_manager.on_memory_write.assert_called_once_with(
+            "add",
+            "memory",
+            "remember this",
+        )
+        assert mock_invoke_hook.call_args_list == [
+            call(
+                "pre_tool_call",
+                tool_name="memory",
+                args={
+                    "action": "add",
+                    "target": "memory",
+                    "content": "remember this",
+                    "route_name": "draft-route",
+                },
+                task_id="task-1",
+                session_id=agent.session_id,
+                tool_call_id="call-1",
+            ),
+            call(
+                "post_tool_call",
+                tool_name="memory",
+                args={
+                    "action": "add",
+                    "target": "memory",
+                    "content": "remember this",
+                    "route_name": "draft-route",
+                },
+                task_id="task-1",
+                session_id=agent.session_id,
+                tool_call_id="call-1",
+                result='{"success": true}',
+            ),
+        ]
 
 
 class TestPathsOverlap:

@@ -375,10 +375,23 @@ memory:
   
   # User profile: preferences, communication style, expectations
   user_profile_enabled: true
+
+  # Failure memory: rejected approaches and dead ends worth avoiding later
+  failure_memory_enabled: true
   
   # Character limits (~2.75 chars per token, model-independent)
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
+  failure_char_limit: 6000
+
+  # Task-time recall overlays for built-in memory and user profile
+  memory_recall_enabled: true
+  memory_recall_max_entries: 4
+  memory_recall_max_chars: 1200
+
+  # Task-time recall for failure routes
+  failure_recall_max_entries: 3
+  failure_recall_max_chars: 1400
 
   # Periodic memory nudge: remind the agent to consider saving memories
   # every N user turns. Set to 0 to disable. Only active when memory is enabled.
@@ -464,6 +477,14 @@ agent:
   # Higher = more room for complex tasks, but costs more tokens
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
   max_turns: 60
+
+  # Final-response quality gate.
+  # Candidate answers are reviewed before they are shown to the user.
+  # Rejected drafts are reworked internally instead of being surfaced.
+  output_review:
+    enabled: true
+    max_retries: 2
+    notify_on_retry: true
 
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving

@@ -383,8 +383,15 @@ For details on declaring config settings in your own skills, see [Creating Skill
 memory:
   memory_enabled: true
   user_profile_enabled: true
+  failure_memory_enabled: true
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
+  failure_char_limit: 6000
+  memory_recall_enabled: true
+  memory_recall_max_entries: 4
+  memory_recall_max_chars: 1200
+  failure_recall_max_entries: 3
+  failure_recall_max_chars: 1400
 ```
 
 ## File Read Safety

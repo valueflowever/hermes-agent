@@ -341,6 +341,11 @@ DEFAULT_CONFIG = {
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.
         "gateway_notify_interval": 600,
+        "output_review": {
+            "enabled": True,
+            "max_retries": 2,
+            "notify_on_retry": True,
+        },
     },
     
     "terminal": {
@@ -480,6 +485,13 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 30,
         },
+        "response_review": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 45,
+        },
         "flush_memories": {
             "provider": "auto",
             "model": "",
@@ -583,8 +595,15 @@ DEFAULT_CONFIG = {
     "memory": {
         "memory_enabled": True,
         "user_profile_enabled": True,
+        "failure_memory_enabled": True,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        "failure_char_limit": 6000,
+        "memory_recall_enabled": True,
+        "memory_recall_max_entries": 4,
+        "memory_recall_max_chars": 1200,
+        "failure_recall_max_entries": 3,
+        "failure_recall_max_chars": 1400,
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".
@@ -700,7 +719,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 17,
+    "_config_version": 18,
 }
 
 # =============================================================================
@@ -2009,6 +2028,56 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                         print(f"  ✓ Migrated compression.summary_* → auxiliary.compression: {', '.join(migrated_keys)}")
                     else:
                         print("  ✓ Removed unused compression.summary_* keys")
+
+    # ── Version 17 → 18: add output-review + failure-memory defaults ──
+    if current_ver < 18:
+        config = read_raw_config()
+        changed = False
+
+        agent_cfg = config.get("agent", {})
+        if not isinstance(agent_cfg, dict):
+            agent_cfg = {}
+        if "output_review" not in agent_cfg:
+            agent_cfg["output_review"] = {
+                "enabled": True,
+                "max_retries": 2,
+                "notify_on_retry": True,
+            }
+            config["agent"] = agent_cfg
+            changed = True
+
+        memory_cfg = config.get("memory", {})
+        if not isinstance(memory_cfg, dict):
+            memory_cfg = {}
+        for key, value in (
+            ("failure_memory_enabled", True),
+            ("failure_char_limit", 6000),
+            ("failure_recall_max_entries", 3),
+            ("failure_recall_max_chars", 1400),
+        ):
+            if key not in memory_cfg:
+                memory_cfg[key] = value
+                changed = True
+        config["memory"] = memory_cfg
+
+        aux_cfg = config.get("auxiliary", {})
+        if not isinstance(aux_cfg, dict):
+            aux_cfg = {}
+        if "response_review" not in aux_cfg:
+            aux_cfg["response_review"] = {
+                "provider": "auto",
+                "model": "",
+                "base_url": "",
+                "api_key": "",
+                "timeout": 45,
+            }
+            config["auxiliary"] = aux_cfg
+            changed = True
+
+        if changed:
+            save_config(config)
+            if not quiet:
+                print("  ✓ Added output-review and failure-memory defaults")
 
     if current_ver < latest_ver and not quiet:
         print(f"Config version: {current_ver} → {latest_ver}")

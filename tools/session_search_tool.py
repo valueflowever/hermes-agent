@@ -241,6 +241,141 @@ async def _summarize_session(
 # HERMES_SESSION_SOURCE=tool so they don't clutter the user's session history.
 _HIDDEN_SESSION_SOURCES = ("tool",)
 
+_SESSION_METADATA_TERM_RE = re.compile(r"[A-Za-z0-9_./:-]{2,}|[\u4e00-\u9fff]{2,}")
+_SESSION_METADATA_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "into",
+    "when",
+    "your",
+    "their",
+    "them",
+    "they",
+    "have",
+    "will",
+    "would",
+    "should",
+    "about",
+    "after",
+    "before",
+    "what",
+    "where",
+    "which",
+    "were",
+    "did",
+    "does",
+    "please",
+    "need",
+    "want",
+    "help",
+    "session",
+    "sessions",
+    "recent",
+}
+
+
+def _metadata_query_terms(query: str) -> List[str]:
+    """Tokenize a free-form query for metadata fallback matching."""
+    terms = []
+    for term in _SESSION_METADATA_TERM_RE.findall((query or "").lower()):
+        if term in _SESSION_METADATA_STOPWORDS:
+            continue
+        if term not in terms:
+            terms.append(term)
+    return terms
+
+
+def _score_metadata_text(query: str, text: str) -> tuple[int, int]:
+    """Return a coarse lexical score for metadata fallback search."""
+    query_lower = (query or "").strip().lower()
+    text_lower = (text or "").strip().lower()
+    if not query_lower or not text_lower:
+        return (0, 0)
+
+    query_terms = _metadata_query_terms(query_lower)
+    text_terms = set(_metadata_query_terms(text_lower))
+
+    overlap = 0
+    exact_bonus = 0
+    if query_lower in text_lower:
+        overlap += 3
+        exact_bonus += 2
+
+    for term in query_terms:
+        if term in text_lower:
+            overlap += 1
+            if len(term) >= 4:
+                exact_bonus += 1
+            continue
+        if term in text_terms:
+            overlap += 1
+
+    return overlap + exact_bonus, exact_bonus
+
+
+def _metadata_session_candidates(
+    db,
+    query: str,
+    *,
+    limit: int,
+    excluded_session_ids: set[str],
+) -> List[Dict[str, Any]]:
+    """Find fallback candidates from session titles/previews when FTS misses."""
+    try:
+        sessions = db.list_sessions_rich(
+            limit=max(limit * 8, 24),
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+        )
+    except Exception:
+        return []
+
+    scored = []
+    for idx, session in enumerate(sessions):
+        session_id = session.get("id", "")
+        if not session_id or session_id in excluded_session_ids:
+            continue
+        if session.get("parent_session_id"):
+            continue
+
+        haystack = " ".join(
+            str(part).strip()
+            for part in (
+                session.get("title", ""),
+                session.get("preview", ""),
+                session.get("source", ""),
+                session.get("model", ""),
+            )
+            if str(part).strip()
+        )
+        score, exact_bonus = _score_metadata_text(query, haystack)
+        if score <= 0:
+            continue
+
+        scored.append(
+            (
+                score,
+                exact_bonus,
+                idx,
+                {
+                    "session_id": session_id,
+                    "source": session.get("source", "unknown"),
+                    "model": session.get("model"),
+                    "session_started": session.get("started_at"),
+                    "title": session.get("title"),
+                    "preview": session.get("preview", ""),
+                    "metadata_match": True,
+                },
+            )
+        )
+
+    scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return [item[3] for item in scored[:limit]]
+
 
 def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
     """Return metadata for the most recent sessions (no LLM calls)."""
@@ -253,12 +388,13 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
             try:
                 sid = current_session_id
                 visited = set()
+                current_root = current_session_id
                 while sid and sid not in visited:
                     visited.add(sid)
+                    current_root = sid
                     s = db.get_session(sid)
                     parent = s.get("parent_session_id") if s else None
                     sid = parent if parent else None
-                current_root = max(visited, key=len) if visited else current_session_id
             except Exception:
                 current_root = current_session_id
 
@@ -334,15 +470,6 @@ def session_search(
             offset=0,
         )
 
-        if not raw_results:
-            return json.dumps({
-                "success": True,
-                "query": query,
-                "results": [],
-                "count": 0,
-                "message": "No matching sessions found.",
-            }, ensure_ascii=False)
-
         # Resolve child sessions to their parent — delegation stores detailed
         # content in child sessions, but the user's conversation is the parent.
         def _resolve_to_parent(session_id: str) -> str:
@@ -393,6 +520,35 @@ def session_search(
                 seen_sessions[resolved_sid] = result
             if len(seen_sessions) >= limit:
                 break
+
+        # Aut-style metadata fallback: when FTS is sparse, also look through
+        # session titles / previews so queries can match remembered session
+        # names even if the exact wording never appeared in a message body.
+        if len(seen_sessions) < limit:
+            excluded_session_ids = set(seen_sessions.keys())
+            if current_lineage_root:
+                excluded_session_ids.add(current_lineage_root)
+            if current_session_id:
+                excluded_session_ids.add(current_session_id)
+            for candidate in _metadata_session_candidates(
+                db,
+                query,
+                limit=limit - len(seen_sessions),
+                excluded_session_ids=excluded_session_ids,
+            ):
+                seen_sessions[candidate["session_id"]] = candidate
+                if len(seen_sessions) >= limit:
+                    break
+
+        if not seen_sessions:
+            return json.dumps({
+                "success": True,
+                "query": query,
+                "results": [],
+                "count": 0,
+                "sessions_searched": 0,
+                "message": "No matching sessions found.",
+            }, ensure_ascii=False)
 
         # Prepare all sessions for parallel summarization
         tasks = []

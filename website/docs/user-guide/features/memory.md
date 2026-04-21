@@ -1,7 +1,7 @@
 ---
 sidebar_position: 3
 title: "Persistent Memory"
-description: "How Hermes Agent remembers across sessions — MEMORY.md, USER.md, and session search"
+description: "How Hermes Agent remembers across sessions — MEMORY.md, USER.md, failure routes, and session search"
 ---
 
 # Persistent Memory
@@ -10,14 +10,15 @@ Hermes Agent has bounded, curated memory that persists across sessions. This let
 
 ## How It Works
 
-Two files make up the agent's memory:
+Three built-in stores make up the agent's memory:
 
-| File | Purpose | Char Limit |
+| File / Path | Purpose | Char Limit |
 |------|---------|------------|
 | **MEMORY.md** | Agent's personal notes — environment facts, conventions, things learned | 2,200 chars (~800 tokens) |
 | **USER.md** | User profile — your preferences, communication style, expectations | 1,375 chars (~500 tokens) |
+| **failures/\*.md** | Failure routes — rejected approaches and hard constraints to avoid repeating | 6,000 chars total |
 
-Both are stored in `~/.hermes/memories/` and are injected into the system prompt as a frozen snapshot at session start. The agent manages its own memory via the `memory` tool — it can add, replace, or remove entries.
+All are stored in `~/.hermes/memories/`. `MEMORY.md` and `USER.md` are injected into the system prompt as a frozen snapshot at session start. Failure routes are recalled selectively at API-call time only when the current task matches them. The agent manages all three via the `memory` tool.
 
 :::info
 Character limits keep memory focused. When memory is full, the agent consolidates or replaces entries to make room for new information.
@@ -25,7 +26,7 @@ Character limits keep memory focused. When memory is full, the agent consolidate
 
 ## How Memory Appears in the System Prompt
 
-At the start of every session, memory entries are loaded from disk and rendered into the system prompt as a frozen block:
+At the start of every session, built-in memory entries are loaded from disk and rendered into the system prompt as frozen blocks:
 
 ```
 ══════════════════════════════════════════════
@@ -44,7 +45,15 @@ The format includes:
 - Individual entries separated by `§` (section sign) delimiters
 - Entries can be multiline
 
-**Frozen snapshot pattern:** The system prompt injection is captured once at session start and never changes mid-session. This is intentional — it preserves the LLM's prefix cache for performance. When the agent adds/removes memory entries during a session, the changes are persisted to disk immediately but won't appear in the system prompt until the next session starts. Tool responses always show the live state.
+**Frozen snapshot pattern:** The system prompt injection is captured once at session start and never changes mid-session. This preserves the LLM's prefix cache for performance.
+
+There is now a second layer of **query-time recall**:
+
+- The frozen `MEMORY.md` / `USER.md` snapshot stays stable for caching
+- Before each API call, Hermes can inject a small **relevant-memory overlay** for the current task
+- Failure routes are also recalled only when their filenames/content match the current task
+
+This gives you better recall without constantly rebuilding the system prompt.
 
 ## Memory Tool Actions
 
@@ -54,7 +63,7 @@ The agent uses the `memory` tool with these actions:
 - **replace** — Replace an existing entry with updated content (uses substring matching via `old_text`)
 - **remove** — Remove an entry that's no longer relevant (uses substring matching via `old_text`)
 
-There is no `read` action — memory content is automatically injected into the system prompt at session start. The agent sees its memories as part of its conversation context.
+There is no `read` action — the agent receives memory automatically through the frozen system-prompt snapshot plus task-relevant recall overlays.
 
 ### Substring Matching
 
@@ -69,7 +78,7 @@ memory(action="replace", target="memory",
 
 If the substring matches multiple entries, an error is returned asking for a more specific match.
 
-## Two Targets Explained
+## Three Targets Explained
 
 ### `memory` — Agent's Personal Notes
 
@@ -78,8 +87,8 @@ For information the agent needs to remember about the environment, workflows, an
 - Environment facts (OS, tools, project structure)
 - Project conventions and configuration
 - Tool quirks and workarounds discovered
-- Completed task diary entries
-- Skills and techniques that worked
+- Durable workflow notes
+- Stable technical facts that matter again later
 
 ### `user` — User Profile
 
@@ -91,6 +100,17 @@ For information about the user's identity, preferences, and communication style:
 - Workflow habits
 - Technical skill level
 
+### `failure` — Failure Routes
+
+For rejected approaches and hard constraints that should actively steer the agent away from repeating a known bad route:
+
+- Dead ends that looked plausible but failed
+- Drafting patterns that produced low-quality output
+- Environment-specific traps
+- Approaches the user explicitly rejected
+
+Failure entries are stored in named files under `~/.hermes/memories/failures/`. Hermes first matches route filenames against the current task, then loads only those files. This is intentionally more selective than normal memory injection.
+
 ## What to Save vs Skip
 
 ### Save These (Proactively)
@@ -101,7 +121,7 @@ The agent saves automatically — you don't need to ask. It saves when it learns
 - **Environment facts:** "This server runs Debian 12 with PostgreSQL 16" → save to `memory`
 - **Corrections:** "Don't use `sudo` for Docker commands, user is in docker group" → save to `memory`
 - **Conventions:** "Project uses tabs, 120-char line width, Google-style docstrings" → save to `memory`
-- **Completed work:** "Migrated database from MySQL to PostgreSQL on 2026-01-15" → save to `memory`
+- **Failure lesson:** "Do not show unreviewed draft output to the user" → save to `failure`
 - **Explicit requests:** "Remember that my API key rotation happens monthly" → save to `memory`
 
 ### Skip These
@@ -120,6 +140,7 @@ Memory has strict character limits to keep system prompts bounded:
 |-------|-------|----------------|
 | memory | 2,200 chars | 8-15 entries |
 | user | 1,375 chars | 5-10 entries |
+| failure | 6,000 chars total | 5-20 route-scoped lessons |
 
 ### What Happens When Memory is Full
 
@@ -141,6 +162,33 @@ The agent should then:
 4. Then `add` the new entry
 
 **Best practice:** When memory is above 80% capacity (visible in the system prompt header), consolidate entries before adding new ones. For example, merge three separate "project uses X" entries into one comprehensive project description entry.
+
+### Structured Memory Entries
+
+`memory(action="add")` still accepts plain text, but Hermes now also supports optional structured fields:
+
+- `kind`
+- `name`
+- `description`
+- `tags`
+
+These fields are stored as lightweight frontmatter ahead of the entry body. They improve future recall because task-time memory selection can match on metadata as well as body text.
+
+Example:
+
+```python
+memory(
+  action="add",
+  target="memory",
+  kind="environment",
+  name="docker-networking",
+  description="bridge subnet override for this project",
+  tags=["docker", "networking", "bridge"],
+  content="Project runs in Docker bridge mode and needs a custom subnet to avoid VPN collisions."
+)
+```
+
+Older plain-text entries still work unchanged.
 
 ### Practical Examples of Good Memory Entries
 
@@ -171,6 +219,36 @@ The memory system automatically rejects exact duplicate entries. If you try to a
 ## Security Scanning
 
 Memory entries are scanned for injection and exfiltration patterns before being accepted, since they're injected into the system prompt. Content matching threat patterns (prompt injection, credential exfiltration, SSH backdoors) or containing invisible Unicode characters is blocked.
+
+## Failure Routes
+
+Failure routes are built-in durable anti-pattern memory. They are designed for lessons like:
+
+- "Do not leak unreviewed drafts to the user"
+- "Do not assume SSH_AUTH_SOCK exists inside Docker"
+- "Do not remove required Node.js packages while slimming the image"
+
+When Hermes stores a failure memory, it can place it in a named route file such as:
+
+```text
+~/.hermes/memories/failures/output-review-unreviewed-draft.md
+```
+
+Each route file now carries lightweight metadata alongside the entries:
+
+- `Description:` — one-line summary of what the route is about
+- `Tags:` — compact topical tags derived from the route name and recent entries
+- `Keywords:` — broader lexical hints used for matching
+
+This metadata improves route matching without forcing every failure route into every prompt.
+
+At runtime Hermes:
+
+1. Matches route filenames against the current task
+2. Loads only the best-matching route files
+3. Injects them as a temporary failure-memory block
+
+This means failure lessons remain precise and low-noise instead of polluting every session prompt.
 
 ## Session Search
 
@@ -203,8 +281,19 @@ hermes sessions list    # Browse past sessions
 memory:
   memory_enabled: true
   user_profile_enabled: true
+  failure_memory_enabled: true
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
+  failure_char_limit: 6000
+
+  # Task-time recall overlay for built-in memory/user entries
+  memory_recall_enabled: true
+  memory_recall_max_entries: 4
+  memory_recall_max_chars: 1200
+
+  # Task-time failure-route recall
+  failure_recall_max_entries: 3
+  failure_recall_max_chars: 1400
 ```
 
 ## External Memory Providers
