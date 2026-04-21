@@ -6,9 +6,21 @@ import os
 import tempfile
 import time
 import unittest
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"websockets\.InvalidStatusCode is deprecated",
+    category=DeprecationWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"websockets\.legacy is deprecated.*",
+    category=DeprecationWarning,
+)
 
 try:
     import lark_oapi

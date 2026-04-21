@@ -30,6 +30,9 @@ from pathlib import Path
 from typing import List, Dict, Any
 import traceback
 
+if not os.getenv("OPENROUTER_API_KEY"):
+    pytest.skip("OPENROUTER_API_KEY not set", allow_module_level=True)
+
 # Add project root to path to import batch_runner
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -179,7 +182,7 @@ def test_current_implementation():
     except Exception as e:
         print(f"❌ Error during run: {e}")
         traceback.print_exc()
-        return False
+        pytest.fail(f"Error during run: {e}")
     finally:
         _cleanup_test_artifacts(dataset_file, output_dir)
     
@@ -195,11 +198,11 @@ def test_current_implementation():
     if len(snapshots) == 0:
         print("\n❌ ISSUE: No checkpoint updates observed during run")
         print("   This suggests checkpoints are only saved at the end")
-        return False
+        pytest.fail("No checkpoint updates observed during run")
     elif len(snapshots) == 1:
         print("\n⚠️  WARNING: Only 1 checkpoint update (likely at the end)")
         print("   This confirms the bug - no incremental checkpointing")
-        return False
+        pytest.fail("Only 1 checkpoint update observed; checkpointing is not incremental")
     else:
         print(f"\n✅ GOOD: Multiple checkpoint updates ({len(snapshots)}) observed")
         print("   Checkpointing appears to be incremental")
@@ -210,7 +213,7 @@ def test_current_implementation():
             print(f"   {i}. [{snapshot['elapsed_seconds']:6.2f}s] "
                   f"{snapshot['completed_count']} prompts completed")
         
-        return True
+        assert len(snapshots) > 1
 
 
 def test_interruption_and_resume():
@@ -259,7 +262,7 @@ def test_interruption_and_resume():
         # Check checkpoint after first run
         if not checkpoint_file.exists():
             print("❌ ERROR: Checkpoint file not created after first run")
-            return False
+            pytest.fail("Checkpoint file not created after first run")
         
         with open(checkpoint_file, 'r') as f:
             checkpoint_data = json.load(f)
@@ -298,15 +301,15 @@ def test_interruption_and_resume():
         
         if final_completed == 15:
             print("\n✅ PASS: Resume successfully completed all prompts")
-            return True
+            assert final_completed == 15
         else:
             print(f"\n❌ FAIL: Expected 15 completed, got {final_completed}")
-            return False
+            pytest.fail(f"Expected 15 completed prompts after resume, got {final_completed}")
             
     except Exception as e:
         print(f"❌ Error during test: {e}")
         traceback.print_exc()
-        return False
+        pytest.fail(f"Error during test: {e}")
     finally:
         _cleanup_test_artifacts(dataset_file, temp_dataset, output_dir)
 

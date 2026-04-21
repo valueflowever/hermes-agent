@@ -18,6 +18,7 @@ import threading
 
 # Set of thread idents that have been interrupted.
 _interrupted_threads: set[int] = set()
+_global_interrupt = False
 _lock = threading.Lock()
 
 
@@ -29,12 +30,17 @@ def set_interrupt(active: bool, thread_id: int | None = None) -> None:
         thread_id: Target thread ident.  When None, targets the
                    current thread (backward compat for CLI/tests).
     """
-    tid = thread_id if thread_id is not None else threading.current_thread().ident
     with _lock:
-        if active:
-            _interrupted_threads.add(tid)
+        if thread_id is None:
+            global _global_interrupt
+            _global_interrupt = bool(active)
+            if not active:
+                _interrupted_threads.clear()
         else:
-            _interrupted_threads.discard(tid)
+            if active:
+                _interrupted_threads.add(thread_id)
+            else:
+                _interrupted_threads.discard(thread_id)
 
 
 def is_interrupted() -> bool:
@@ -45,7 +51,7 @@ def is_interrupted() -> bool:
     """
     tid = threading.current_thread().ident
     with _lock:
-        return tid in _interrupted_threads
+        return _global_interrupt or tid in _interrupted_threads
 
 
 # ---------------------------------------------------------------------------

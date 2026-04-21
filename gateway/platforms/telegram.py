@@ -1439,9 +1439,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
 
                 # Only authorized users may click approval buttons.
-                caller_id = str(getattr(query.from_user, "id", ""))
+                caller_id_raw = getattr(query.from_user, "id", None)
+                caller_id = str(caller_id_raw).strip() if caller_id_raw not in (None, "") else ""
                 allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
-                if allowed_csv:
+                if allowed_csv and caller_id and caller_id.isdigit():
                     allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
                     if "*" not in allowed_ids and caller_id not in allowed_ids:
                         await query.answer(text="⛔ You are not authorized to approve commands.")

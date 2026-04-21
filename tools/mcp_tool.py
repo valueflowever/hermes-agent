@@ -1148,6 +1148,21 @@ def _run_on_mcp_loop(coro, timeout: float = 30):
     return future.result(timeout=timeout)
 
 
+def _run_on_mcp_loop_guarded(coro, timeout: float = 30):
+    """Run a coroutine on the MCP loop and close it when tests mock the bridge."""
+    try:
+        return _run_on_mcp_loop(coro, timeout=timeout)
+    finally:
+        if inspect.iscoroutine(coro):
+            try:
+                from unittest.mock import Mock
+
+                if isinstance(_run_on_mcp_loop, Mock):
+                    coro.close()
+            except Exception:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Config loading
 # ---------------------------------------------------------------------------
@@ -1270,7 +1285,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return json.dumps({"result": text_result})
 
         try:
-            return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+            return _run_on_mcp_loop_guarded(_call(), timeout=tool_timeout)
         except Exception as exc:
             logger.error(
                 "MCP tool %s/%s call failed: %s",
@@ -1313,7 +1328,7 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
             return json.dumps({"resources": resources})
 
         try:
-            return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+            return _run_on_mcp_loop_guarded(_call(), timeout=tool_timeout)
         except Exception as exc:
             logger.error(
                 "MCP %s/list_resources failed: %s", server_name, exc,
@@ -1357,7 +1372,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
             return json.dumps({"result": "\n".join(parts) if parts else ""})
 
         try:
-            return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+            return _run_on_mcp_loop_guarded(_call(), timeout=tool_timeout)
         except Exception as exc:
             logger.error(
                 "MCP %s/read_resource failed: %s", server_name, exc,
@@ -1404,7 +1419,7 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
             return json.dumps({"prompts": prompts})
 
         try:
-            return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+            return _run_on_mcp_loop_guarded(_call(), timeout=tool_timeout)
         except Exception as exc:
             logger.error(
                 "MCP %s/list_prompts failed: %s", server_name, exc,
@@ -1459,7 +1474,7 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
             return json.dumps(resp)
 
         try:
-            return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+            return _run_on_mcp_loop_guarded(_call(), timeout=tool_timeout)
         except Exception as exc:
             logger.error(
                 "MCP %s/get_prompt failed: %s", server_name, exc,
@@ -2101,7 +2116,7 @@ def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
         )
 
     try:
-        _run_on_mcp_loop(_probe_all(), timeout=120)
+        _run_on_mcp_loop_guarded(_probe_all(), timeout=120)
     except Exception as exc:
         logger.debug("MCP probe failed: %s", exc)
     finally:

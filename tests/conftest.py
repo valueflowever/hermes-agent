@@ -5,6 +5,7 @@ import os
 import signal
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,6 +15,31 @@ import pytest
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+# ACP tests import ``acp.schema`` directly. When pytest adds ``tests/`` to
+# sys.path, the namespace package at tests/acp can shadow the installed ACP
+# distribution during collection. Preload the real package once here so later
+# imports reuse the populated sys.modules entries.
+try:  # pragma: no cover - test bootstrap compatibility shim
+    import acp  # noqa: F401
+    import acp.schema  # noqa: F401
+except Exception:
+    pass
+
+# A handful of tests intentionally patch async bridges with plain mocks to
+# avoid spinning real event loops/subprocesses. CPython reports those leaked
+# coroutines at GC time as unraisable warnings, which are noisy but not
+# actionable product failures. Suppress only the known test-harness patterns.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Exception ignored in: <coroutine object AsyncMockMixin\._execute_mock_call.*",
+    category=pytest.PytestUnraisableExceptionWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"Exception ignored in: <coroutine object Process\.communicate.*",
+    category=pytest.PytestUnraisableExceptionWarning,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -38,8 +64,25 @@ def _isolate_hermes_home(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_NAME", raising=False)
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
-    # Avoid making real calls during tests if this key is set in the env files
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    # Avoid leaking real provider credentials between tests. Individual tests
+    # that need specific auth paths explicitly set these env vars.
+    for key in (
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "NOUS_API_KEY",
+        "KIMI_API_KEY",
+        "MINIMAX_API_KEY",
+        "MINIMAX_CN_API_KEY",
+        "ZAI_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "GEMINI_API_KEY",
+        "OPENCODE_GO_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
 
 @pytest.fixture()

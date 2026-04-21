@@ -62,6 +62,14 @@ _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
 
 
+def _current_lock_file() -> Path:
+    """Return the current tick lock path for the active HERMES_HOME."""
+    hermes_home = get_hermes_home()
+    lock_dir = hermes_home / "cron"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    return lock_dir / ".tick.lock"
+
+
 def _resolve_origin(job: dict) -> Optional[dict]:
     """Extract origin info from a job, preserving any extra routing metadata."""
     origin = job.get("origin")
@@ -909,12 +917,12 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
-    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_file_path = _current_lock_file()
 
     # Cross-platform file locking: fcntl on Unix, msvcrt on Windows
     lock_fd = None
     try:
-        lock_fd = open(_LOCK_FILE, "w")
+        lock_fd = open(lock_file_path, "w")
         if fcntl:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt:

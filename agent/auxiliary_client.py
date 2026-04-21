@@ -634,18 +634,12 @@ def _nous_base_url() -> str:
 def _read_codex_access_token() -> Optional[str]:
     """Read a valid, non-expired Codex OAuth access token from Hermes auth store.
 
-    If a credential pool exists but currently has no selectable runtime entry
-    (for example all pool slots are marked exhausted), fall back to the
-    profile's auth.json token instead of hard-failing. This keeps explicit
-    fallback-to-Codex working when the pool state is stale but the stored OAuth
-    token is still valid.
+    This intentionally reads the profile's Hermes auth store only. Runtime
+    pool resolution and optional Codex CLI import happen in ``_try_codex()``
+    before this helper is reached; keeping this function auth-store-only
+    avoids surprising cross-profile fallback when a machine happens to have
+    shared Codex CLI credentials on disk.
     """
-    pool_present, entry = _select_pool_entry("openai-codex")
-    if pool_present:
-        token = _pool_runtime_api_key(entry)
-        if token:
-            return token
-
     try:
         from hermes_cli.auth import _read_codex_tokens
         data = _read_codex_tokens()
@@ -969,8 +963,12 @@ def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
     except Exception:
         pass
 
-    from agent.anthropic_adapter import _is_oauth_token
-    is_oauth = _is_oauth_token(token)
+    from agent.anthropic_adapter import _is_oauth_token, _is_third_party_anthropic_endpoint
+    is_oauth = _is_oauth_token(token) or (
+        bool(token)
+        and not str(token).startswith("sk-ant-api")
+        and not _is_third_party_anthropic_endpoint(base_url)
+    )
     model = _API_KEY_PROVIDER_AUX_MODELS.get("anthropic", "claude-haiku-4-5-20251001")
     logger.debug("Auxiliary client: Anthropic native (%s) at %s (oauth=%s)", model, base_url, is_oauth)
     try:
@@ -1567,6 +1565,16 @@ def get_text_auxiliary_client(
     (e.g. auxiliary.compression.model, auxiliary.web_extract.model).
     """
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
+    normalized_runtime = _normalize_main_runtime(main_runtime)
+    if (
+        task == "response_review"
+        and provider in ("", "auto")
+        and normalized_runtime.get("provider") == "openai-codex"
+    ):
+        logger.info(
+            "Auxiliary response_review: skipping implicit review backend for openai-codex main runtime"
+        )
+        return None, None
     return resolve_provider_client(
         provider,
         model=model,
@@ -1585,6 +1593,16 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
     Returns (None, None) when no provider is available.
     """
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
+    normalized_runtime = _normalize_main_runtime(main_runtime)
+    if (
+        task == "response_review"
+        and provider in ("", "auto")
+        and normalized_runtime.get("provider") == "openai-codex"
+    ):
+        logger.info(
+            "Auxiliary response_review: skipping implicit async review backend for openai-codex main runtime"
+        )
+        return None, None
     return resolve_provider_client(
         provider,
         model=model,
@@ -1741,6 +1759,30 @@ def resolve_vision_provider_client(
     if client is None:
         return requested, None, None
     return requested, client, final_model
+
+
+def get_vision_auxiliary_client(
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    *,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    async_mode: bool = False,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """Compatibility helper returning just ``(client, model)`` for vision.
+
+    ``resolve_vision_provider_client()`` is the richer API that also reports
+    the resolved provider. Some callers and tests still use the historical
+    ``get_vision_auxiliary_client()`` shape, so keep this thin wrapper.
+    """
+    _provider, client, resolved_model = resolve_vision_provider_client(
+        provider,
+        model,
+        base_url=base_url,
+        api_key=api_key,
+        async_mode=async_mode,
+    )
+    return client, resolved_model
 
 
 def get_auxiliary_extra_body() -> dict:
@@ -2039,12 +2081,18 @@ def _resolve_task_provider_model(
 
 
 _DEFAULT_AUX_TIMEOUT = 30.0
+_TASK_DEFAULT_TIMEOUTS = {
+    # Review is best-effort and should fail fast rather than hold up the
+    # user's visible response for tens of seconds.
+    "response_review": 5.0,
+}
 
 
 def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
     """Read timeout from auxiliary.{task}.timeout in config, falling back to *default*."""
     if not task:
         return default
+    default = _TASK_DEFAULT_TIMEOUTS.get(task, default)
     try:
         from hermes_cli.config import load_config
         config = load_config()

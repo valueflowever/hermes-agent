@@ -83,19 +83,20 @@ class PairingStore:
     """
 
     def __init__(self):
-        PAIRING_DIR.mkdir(parents=True, exist_ok=True)
+        self._pairing_dir = get_hermes_dir("platforms/pairing", "pairing")
+        self._pairing_dir.mkdir(parents=True, exist_ok=True)
         # Protects all read-modify-write cycles. The gateway runs multiple
         # platform adapters concurrently in threads sharing one PairingStore.
         self._lock = threading.RLock()
 
     def _pending_path(self, platform: str) -> Path:
-        return PAIRING_DIR / f"{platform}-pending.json"
+        return self._pairing_dir / f"{platform}-pending.json"
 
     def _approved_path(self, platform: str) -> Path:
-        return PAIRING_DIR / f"{platform}-approved.json"
+        return self._pairing_dir / f"{platform}-approved.json"
 
     def _rate_limit_path(self) -> Path:
-        return PAIRING_DIR / "_rate_limits.json"
+        return self._pairing_dir / "_rate_limits.json"
 
     def _load_json(self, path: Path) -> dict:
         if path.exists():
@@ -301,7 +302,7 @@ class PairingStore:
     def _all_platforms(self, suffix: str) -> list:
         """List all platforms that have data files of a given suffix."""
         platforms = []
-        for f in PAIRING_DIR.iterdir():
+        for f in self._pairing_dir.iterdir():
             if f.name.endswith(f"-{suffix}.json"):
                 platform = f.name.replace(f"-{suffix}.json", "")
                 if not platform.startswith("_"):

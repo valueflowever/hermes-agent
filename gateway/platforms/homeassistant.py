@@ -145,7 +145,11 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30)
         )
-        self._ws = await self._session.ws_connect(ws_url, heartbeat=30, timeout=30)
+        self._ws = await self._session.ws_connect(
+            ws_url,
+            heartbeat=30,
+            timeout=aiohttp.ClientWSTimeout(ws_close=30),
+        )
 
         # Step 1: Receive auth_required
         msg = await self._ws.receive_json()
@@ -187,26 +191,40 @@ class HomeAssistantAdapter(BasePlatformAdapter):
     async def _cleanup_ws(self) -> None:
         """Close WebSocket and session."""
         if self._ws and not self._ws.closed:
-            await self._ws.close()
+            try:
+                await asyncio.wait_for(self._ws.close(), timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            except Exception:
+                logger.debug("[%s] Ignoring websocket close error", self.name, exc_info=True)
         self._ws = None
         if self._session and not self._session.closed:
-            await self._session.close()
+            try:
+                await asyncio.wait_for(self._session.close(), timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
         self._session = None
 
     async def disconnect(self) -> None:
         """Disconnect from Home Assistant."""
         self._running = False
-        if self._listen_task:
-            self._listen_task.cancel()
+        listen_task = self._listen_task
+        if listen_task:
+            listen_task.cancel()
+        # Close the websocket/session after cancelling the listener so any
+        # pending receive() unblocks, but don't let close handshakes hang.
+        await self._cleanup_ws()
+        if listen_task:
             try:
-                await self._listen_task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(listen_task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
             self._listen_task = None
-
-        await self._cleanup_ws()
         if self._rest_session and not self._rest_session.closed:
-            await self._rest_session.close()
+            try:
+                await asyncio.wait_for(self._rest_session.close(), timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
         self._rest_session = None
         logger.info("[%s] Disconnected", self.name)
 

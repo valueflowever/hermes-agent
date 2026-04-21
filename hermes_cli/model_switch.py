@@ -895,6 +895,19 @@ def list_authenticated_providers(
                     has_creds = True
             except Exception as exc:
                 logger.debug("Credential pool check failed for %s: %s", hermes_slug, exc)
+        # Discovery-only fallback for Codex CLI shared auth. Keep this logic
+        # local to the /model picker so generic pool reads do not silently
+        # import external credentials into Hermes auth state.
+        if not has_creds and hermes_slug == "openai-codex":
+            try:
+                from hermes_cli.auth import _import_codex_cli_tokens, _save_codex_tokens
+
+                cli_tokens = _import_codex_cli_tokens()
+                if cli_tokens:
+                    _save_codex_tokens(cli_tokens)
+                    has_creds = True
+            except Exception as exc:
+                logger.debug("Codex CLI auth discovery failed: %s", exc)
         # Fallback: check external credential files directly.
         # The credential pool gates anthropic behind
         # is_provider_explicitly_configured() to prevent auxiliary tasks
@@ -930,7 +943,11 @@ def list_authenticated_providers(
             "is_user_defined": False,
             "models": top,
             "total_models": total,
-            "source": "hermes",
+            "source": (
+                "built-in"
+                if hermes_slug in PROVIDER_TO_MODELS_DEV or pid in PROVIDER_TO_MODELS_DEV
+                else "hermes"
+            ),
         })
         seen_slugs.add(pid)
         seen_slugs.add(hermes_slug)

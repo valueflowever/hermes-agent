@@ -153,6 +153,12 @@ COMPONENT_PREFIXES = {
     "cron": ("cron",),
 }
 
+_HERMES_LOGGER_PREFIXES = tuple(
+    prefix
+    for prefixes in COMPONENT_PREFIXES.values()
+    for prefix in prefixes
+)
+
 
 # ---------------------------------------------------------------------------
 # Main setup
@@ -256,6 +262,17 @@ def setup_logging(
     # Ensure root logger level is low enough for the handlers to fire.
     if root.level == logging.NOTSET or root.level > level:
         root.setLevel(level)
+
+    # Tests and long-lived processes can leave Hermes component loggers with
+    # stale levels/disabled flags from earlier runs. Reset them here so
+    # agent.log remains the catch-all across repeated setup_logging() calls.
+    for name, logger_obj in logging.root.manager.loggerDict.items():
+        if not isinstance(logger_obj, logging.Logger):
+            continue
+        if name.startswith(_HERMES_LOGGER_PREFIXES):
+            logger_obj.disabled = False
+            logger_obj.propagate = True
+            logger_obj.setLevel(logging.NOTSET)
 
     # Suppress noisy third-party loggers.
     for name in _NOISY_LOGGERS:

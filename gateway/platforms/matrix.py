@@ -951,14 +951,41 @@ class MatrixAdapter(BasePlatformAdapter):
 
     async def _sync_loop(self) -> None:
         """Continuously sync with the homeserver."""
+        import inspect
+        import sys
+
         client = self._client
         # Resume from the token stored during the initial sync.
-        next_batch = await client.sync_store.get_next_batch()
+        next_batch = client.sync_store.get_next_batch()
+        if inspect.isawaitable(next_batch):
+            next_batch = await next_batch
+        if not isinstance(next_batch, str):
+            next_batch = None
+
+        sync_accepts_since = True
+        try:
+            sync_accepts_since = "since" in inspect.signature(client.sync).parameters
+        except (TypeError, ValueError):
+            pass
         while not self._closing:
             try:
-                sync_data = await client.sync(
-                    since=next_batch, timeout=30000,
-                )
+                sync_kwargs = {"timeout": 30000}
+                if sync_accepts_since and next_batch:
+                    sync_kwargs["since"] = next_batch
+                sync_data = await client.sync(**sync_kwargs)
+
+                nio_mod = sys.modules.get("nio")
+                sync_error_cls = getattr(nio_mod, "SyncError", None) if nio_mod else None
+                if sync_error_cls and isinstance(sync_data, sync_error_cls):
+                    err_msg = str(getattr(sync_data, "message", sync_data) or "")
+                    err_lower = err_msg.lower()
+                    if "m_unknown_token" in err_lower or "401" in err_lower or "403" in err_lower:
+                        logger.error("Matrix: permanent auth sync error: %s — stopping sync", err_msg)
+                        return
+                    logger.warning("Matrix: sync returned error %s — retrying in 5s", err_msg)
+                    await asyncio.sleep(5)
+                    continue
+
                 if isinstance(sync_data, dict):
                     # Update joined rooms from sync response.
                     rooms_join = sync_data.get("rooms", {}).get("join", {})
@@ -970,7 +997,9 @@ class MatrixAdapter(BasePlatformAdapter):
                     nb = sync_data.get("next_batch")
                     if nb:
                         next_batch = nb
-                        await client.sync_store.put_next_batch(nb)
+                        store_result = client.sync_store.put_next_batch(nb)
+                        if inspect.isawaitable(store_result):
+                            await store_result
 
                     # Dispatch events to registered handlers so that
                     # _on_room_message / _on_reaction / _on_invite fire.

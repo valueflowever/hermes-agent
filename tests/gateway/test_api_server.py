@@ -218,7 +218,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     """Create the aiohttp app from the adapter (without starting the full server)."""
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
     app = web.Application(middlewares=mws)
-    app["api_server_adapter"] = adapter
+    from gateway.platforms.api_server import _API_SERVER_ADAPTER_KEY
+
+    app[_API_SERVER_ADAPTER_KEY] = adapter
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)

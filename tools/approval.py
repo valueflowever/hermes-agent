@@ -722,7 +722,10 @@ def check_all_command_guards(command: str, env_type: str,
     tirith_result = {"action": "allow", "findings": [], "summary": ""}
     try:
         from tools.tirith_security import check_command_security
-        tirith_result = check_command_security(command)
+        tirith_result = check_command_security(
+            command,
+            non_blocking=bool(is_gateway or is_ask),
+        )
     except ImportError:
         pass  # tirith module not installed — allow
 

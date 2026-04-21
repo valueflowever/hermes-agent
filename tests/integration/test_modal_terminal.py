@@ -55,6 +55,15 @@ _get_env_config = terminal_module._get_env_config
 cleanup_vm = terminal_module.cleanup_vm
 get_active_environments_info = terminal_module.get_active_environments_info
 
+_modal_config = _get_env_config()
+_modal_token = os.getenv("MODAL_TOKEN_ID")
+_modal_toml = Path.home() / ".modal.toml"
+
+if _modal_config["env_type"] != "modal":
+    pytest.skip("TERMINAL_ENV is not modal", allow_module_level=True)
+if not (_modal_token or _modal_toml.exists()):
+    pytest.skip("Modal credentials not configured", allow_module_level=True)
+
 
 def test_modal_requirements():
     """Test that Modal requirements are met."""
@@ -77,12 +86,12 @@ def test_modal_requirements():
     if config['env_type'] != 'modal':
         print(f"\n⚠️  TERMINAL_ENV is '{config['env_type']}', not 'modal'")
         print("   Set TERMINAL_ENV=modal in .env or export it to test Modal backend")
-        return False
+        pytest.skip("TERMINAL_ENV is not modal")
     
     requirements_met = check_terminal_requirements()
     print(f"\nRequirements check: {'✅ Passed' if requirements_met else '❌ Failed'}")
     
-    return requirements_met
+    assert requirements_met
 
 
 def test_simple_command():
@@ -108,7 +117,7 @@ def test_simple_command():
     # Cleanup
     cleanup_vm(test_task_id)
     
-    return success
+    assert success
 
 
 def test_python_execution():
@@ -136,7 +145,7 @@ def test_python_execution():
     # Cleanup
     cleanup_vm(test_task_id)
     
-    return success
+    assert success
 
 
 def test_pip_install():
@@ -148,10 +157,10 @@ def test_pip_install():
     test_task_id = "modal_test_pip"
     
     # Install a small package and verify
-    print("Executing: pip install --break-system-packages cowsay && python3 -c \"import cowsay; cowsay.cow('Modal works!')\"")
+    print("Executing: python3 -m pip install --break-system-packages cowsay && python3 -c \"import cowsay; cowsay.cow('Modal works!')\"")
     
     result = terminal_tool(
-        "pip install --break-system-packages cowsay && python3 -c \"import cowsay; cowsay.cow('Modal works!')\"",
+        "python3 -m pip install --break-system-packages cowsay && python3 -c \"import cowsay; cowsay.cow('Modal works!')\"",
         task_id=test_task_id,
         timeout=120
     )
@@ -169,7 +178,7 @@ def test_pip_install():
     # Cleanup
     cleanup_vm(test_task_id)
     
-    return success
+    assert success
 
 
 def test_filesystem_persistence():
@@ -203,7 +212,7 @@ def test_filesystem_persistence():
     # Cleanup
     cleanup_vm(test_task_id)
     
-    return success
+    assert success
 
 
 def test_environment_isolation():
@@ -235,7 +244,7 @@ def test_environment_isolation():
     cleanup_vm(task1)
     cleanup_vm(task2)
     
-    return isolated
+    assert isolated
 
 
 def main():

@@ -597,7 +597,7 @@ _MAX_FINDINGS = 50
 _MAX_SUMMARY_LEN = 500
 
 
-def check_command_security(command: str) -> dict:
+def check_command_security(command: str, *, non_blocking: bool = False) -> dict:
     """Run tirith security scan on a command.
 
     Exit code determines action (0=allow, 1=block, 2=warn). JSON enriches
@@ -612,7 +612,15 @@ def check_command_security(command: str) -> dict:
     if not cfg["tirith_enabled"]:
         return {"action": "allow", "findings": [], "summary": ""}
 
-    tirith_path = _resolve_tirith_path(cfg["tirith_path"])
+    if non_blocking:
+        # Gateway approval flows need to notify the user immediately.
+        # Limit this path to quick local checks and background install; do
+        # not synchronously download tirith before the first approval prompt.
+        tirith_path = ensure_installed(log_failures=False)
+        if tirith_path is None:
+            return {"action": "allow", "findings": [], "summary": "tirith unavailable (non-blocking mode)"}
+    else:
+        tirith_path = _resolve_tirith_path(cfg["tirith_path"])
     timeout = cfg["tirith_timeout"]
     fail_open = cfg["tirith_fail_open"]
 

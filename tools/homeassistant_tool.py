@@ -11,6 +11,7 @@ The HA instance URL is read from ``HASS_URL`` (default: http://homeassistant.loc
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -221,6 +222,27 @@ def _run_async(coro):
         return asyncio.run(coro)
 
 
+def _run_async_guarded(coro):
+    """Run a coroutine through _run_async and close it when tests mock the bridge.
+
+    Several unit tests monkeypatch _run_async with a plain Mock to avoid
+    spinning an event loop. In that case the coroutine would never be awaited
+    and Python emits an unraisable warning at GC time. Close only when the
+    bridge is clearly mocked.
+    """
+    try:
+        return _run_async(coro)
+    finally:
+        if inspect.iscoroutine(coro):
+            try:
+                from unittest.mock import Mock
+
+                if isinstance(_run_async, Mock):
+                    coro.close()
+            except Exception:
+                pass
+
+
 def _handle_list_entities(args: dict, **kw) -> str:
     """Handler for ha_list_entities tool."""
     domain = args.get("domain")
@@ -241,7 +263,7 @@ def _handle_get_state(args: dict, **kw) -> str:
     if not _ENTITY_ID_RE.match(entity_id):
         return tool_error(f"Invalid entity_id format: {entity_id}")
     try:
-        result = _run_async(_async_get_state(entity_id))
+        result = _run_async_guarded(_async_get_state(entity_id))
         return json.dumps({"result": result})
     except Exception as e:
         logger.error("ha_get_state error: %s", e)
@@ -281,7 +303,7 @@ def _handle_call_service(args: dict, **kw) -> str:
             return tool_error(f"Invalid JSON string in 'data' parameter: {e}")
 
     try:
-        result = _run_async(_async_call_service(domain, service, entity_id, data))
+        result = _run_async_guarded(_async_call_service(domain, service, entity_id, data))
         return json.dumps({"result": result})
     except Exception as e:
         logger.error("ha_call_service error: %s", e)
